@@ -1,0 +1,9 @@
+[package]
+name = "get_mut_drop_weak"
+version = "0.1.0"
+edition = "2024"
+description = "A function to safely get a mutable reference to an Arc and dissociate any weak references."
+license = "MIT"
+repository = "https://github.com/dspyz-matician/get_mut_drop_weak"
+
+[dependencies]
