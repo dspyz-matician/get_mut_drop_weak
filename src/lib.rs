@@ -1,4 +1,7 @@
-use std::{mem::MaybeUninit, ptr, sync::Arc};
+use std::{
+    mem::ManuallyDrop,
+    sync::{Arc, Weak},
+};
 
 /// Attempts to get a mutable reference to the inner data of an Arc.
 ///
@@ -15,7 +18,7 @@ use std::{mem::MaybeUninit, ptr, sync::Arc};
 ///
 /// Returns Ok(&mut T) on success, or Err(&mut Arc<T>) if the strong count was
 /// greater than 1.
-/// 
+///
 /// The Err variant is useful for the caller to avoid borrow-checker issues
 /// due to rust's lack of non-lexical lifetimes. That is, if the caller
 /// only has a mutable reference to the Arc, they may not be able to reborrow
@@ -23,68 +26,73 @@ use std::{mem::MaybeUninit, ptr, sync::Arc};
 /// to the inner data. Thus, if the function fails, they may have "lost" the
 /// only reference they had. The Err variant gives it back so they can try
 /// something else.
-/// 
+///
 /// (See https://rust-lang.github.io/rfcs/2094-nll.html#problem-case-2-conditional-control-flow)
-//
-// # Safety Notes
-// This function uses unsafe code internally to handle the Arc replacement
-// while aiming to be panic-safe *after* the initial allocation check.
-// It relies on ptr::read/write and careful state management.
-pub fn get_mut_drop_weak<T>(arc: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
-    // Handle easy cases first without allocation or unsafe code
-    if Arc::get_mut(arc).is_some() {
-        // Strong=1, Weak=0. Already exclusive.
-        // Need to call it again to get the reference with the right lifetime.
-        return Ok(Arc::get_mut(arc).unwrap());
-    }
-    if Arc::strong_count(arc) > 1 {
-        // Strong > 1. Cannot get exclusive access.
-        return Err(arc);
+pub fn get_mut_drop_weak<T>(this: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
+    /// Use [`Arc::get_mut_unchecked`] when stable.
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// let mut a = Arc::new(0usize);
+    /// let b = unsafe { Arc::get_mut_unchecked(&mut a) };
+    /// *b += 1;
+    /// ```
+    unsafe fn get_mut_unchecked<T>(this: &mut Arc<T>) -> &mut T {
+        let ptr = Arc::as_ptr(this);
+        unsafe { &mut *ptr.cast_mut() }
     }
 
-    // State: Strong = 1, Weak > 0. Need to replace the Arc instance.
+    if Arc::get_mut(this).is_some() {
+        return Ok(unsafe { get_mut_unchecked(this) });
+    }
 
-    // --- Potentially panicking allocation happens here ---
-    // Pre-allocate storage for the new Arc. If this fails, we panic *before*
-    // entering the unsafe block or modifying `arc`, which is safe for the caller.
-    let mut preallocated_arc: Arc<MaybeUninit<T>> = Arc::new(MaybeUninit::uninit());
-    // --- Allocation succeeded ---
+    let weak = Arc::downgrade(this);
 
-    // Unsafe block to perform the swap without panicking mid-state-change.
     unsafe {
-        // Read the original Arc out, leaving `arc` pointing to invalid memory temporarily.
-        let original_arc = ptr::read(arc as *mut Arc<T>);
+        let bitcopied = std::ptr::read(this);
 
-        // Consume the original Arc to get the value. Should succeed unless another thread
-        // upgraded a weak reference to a strong one in parallel.
-        match Arc::try_unwrap(original_arc) {
-            Ok(value) => {
-                // Got the value, old weak pointers are now orphaned.
+        match Arc::try_unwrap(bitcopied) {
+            Ok(inner) => {
+                struct ReInitThroughWeak<T> {
+                    weak: ManuallyDrop<Weak<T>>,
+                    inner: ManuallyDrop<T>,
+                }
+                impl<T> ReInitThroughWeak<T> {
+                    unsafe fn new(weak: Weak<T>, inner: T) -> Self {
+                        Self {
+                            weak: ManuallyDrop::new(weak),
+                            inner: ManuallyDrop::new(inner),
+                        }
+                    }
 
-                // Initialize the pre-allocated memory.
-                // get_mut is guaranteed safe because preallocated_arc count is 1.
-                let slot = Arc::get_mut(&mut preallocated_arc).unwrap();
-                slot.write(value); // Moves value, initializes memory.
+                    fn defuse(self) -> T {
+                        let mut this = ManuallyDrop::new(self);
+                        unsafe { ManuallyDrop::drop(&mut this.weak) };
+                        unsafe { ManuallyDrop::take(&mut this.inner) }
+                    }
+                }
+                impl<T> Drop for ReInitThroughWeak<T> {
+                    fn drop(&mut self) {
+                        let ptr = self.weak.as_ptr();
+                        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+                        unsafe { std::ptr::write(ptr.cast_mut(), inner) };
+                        unsafe { Arc::increment_strong_count(ptr) };
+                    }
+                }
 
-                // Convert Arc<MaybeUninit<T>> -> Arc<T>
-                let final_arc = {
-                    let raw_ptr = Arc::into_raw(preallocated_arc).cast::<T>();
-                    // SAFETY: We just initialized the value at raw_ptr via slot.write.
-                    Arc::from_raw(raw_ptr)
-                };
-                // `preallocated_arc` is now consumed.
+                let reinit_guard = ReInitThroughWeak::new(weak, inner);
+                let mut alloc = Arc::new_uninit();
+                let inner = reinit_guard.defuse();
 
-                // Write the new Arc<T> back into the user's reference location.
-                ptr::write(arc, final_arc); // Consumes final_arc.
+                get_mut_unchecked(&mut alloc).write(inner);
+                let initialized = alloc.assume_init();
 
-                // Return mutable reference from the new Arc. Guaranteed safe.
-                // SAFETY: We just wrote a valid Arc<T> to `arc`.
-                Ok(Arc::get_mut(arc).unwrap())
+                std::ptr::write(this, initialized);
+                Ok(get_mut_unchecked(this))
             }
-            Err(restored_arc) => {
-                // Failed to unwrap, meaning another thread upgraded a weak reference.
-                ptr::write(arc, restored_arc); // Consumes restored_arc.
-                Err(arc) // Indicate failure.
+            Err(bitcopied) => {
+                std::ptr::write(this, bitcopied);
+                Err(this)
             }
         }
     }
