@@ -182,3 +182,47 @@ fn test_weak_shared_drops_weak_with_drop_impl() {
     drop(arc);
     assert!(dropped_flag.load(std::sync::atomic::Ordering::SeqCst)); // Now it should be dropped
 }
+
+#[test]
+fn simple_multithreaded() {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    const NUM_WEAK_JOBS: usize = 2;
+
+    let arc = Arc::new(Box::new(42usize));
+    let barrier = Barrier::new(NUM_WEAK_JOBS + 1);
+
+    thread::scope(|s| {
+        for _ in 0..NUM_WEAK_JOBS {
+            let arc = arc.clone();
+            s.spawn(|| {
+                let weak = Arc::downgrade(&arc);
+                assert!(weak.upgrade().is_some());
+                barrier.wait(); // a
+                barrier.wait(); // b
+                drop(arc);
+                barrier.wait(); // c
+                barrier.wait(); // d
+                assert!(weak.upgrade().is_none());
+            });
+        }
+
+        let mut arc = arc;
+        let barrier = &barrier;
+        s.spawn(move || {
+            barrier.wait(); // a
+            get_mut_drop_weak(&mut arc).unwrap_err();
+            barrier.wait(); // b
+            barrier.wait(); // c
+            let b = get_mut_drop_weak(&mut arc).unwrap();
+            **b += 1;
+            assert_eq!(**arc, 43);
+            barrier.wait(); // d
+        })
+        .join()
+        .unwrap();
+    });
+}
