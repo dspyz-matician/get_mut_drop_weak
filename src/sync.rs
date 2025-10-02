@@ -50,10 +50,12 @@ pub fn get_mut_drop_weak<T>(arc: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
     let mut preallocated_arc: Arc<MaybeUninit<T>> = Arc::new_uninit();
     // --- Allocation succeeded ---
 
+    let arc_ptr = ptr::from_mut(arc);
+
     // Unsafe block to perform the swap without panicking mid-state-change.
     unsafe {
         // Read the original Arc out, leaving `arc` pointing to invalid memory temporarily.
-        let original_arc = ptr::read(ptr::from_mut(arc));
+        let original_arc = ptr::read(arc_ptr);
 
         // Consume the original Arc to get the value. Should succeed unless another thread
         // upgraded a weak reference to a strong one in parallel.
@@ -71,7 +73,7 @@ pub fn get_mut_drop_weak<T>(arc: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
                 // `preallocated_arc` is now consumed.
 
                 // Write the new Arc<T> back into the user's reference location.
-                ptr::write(arc, final_arc); // Consumes final_arc.
+                ptr::write(arc_ptr, final_arc); // Consumes final_arc.
 
                 // Return mutable reference from the new Arc. Guaranteed safe.
                 // SAFETY: We just wrote a valid Arc<T> to `arc`.
@@ -79,7 +81,7 @@ pub fn get_mut_drop_weak<T>(arc: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
             }
             Err(restored_arc) => {
                 // Failed to unwrap, meaning another thread upgraded a weak reference.
-                ptr::write(arc, restored_arc); // Consumes restored_arc.
+                ptr::write(arc_ptr, restored_arc); // Consumes restored_arc.
                 Err(arc) // Indicate failure.
             }
         }
