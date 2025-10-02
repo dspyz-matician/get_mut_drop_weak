@@ -57,34 +57,29 @@ pub fn get_mut_drop_weak<T>(rc: &mut Rc<T>) -> Result<&mut T, &mut Rc<T>> {
         // Read the original Rc out, leaving `rc` pointing to invalid memory temporarily.
         let original_rc = ptr::read(rc_ptr);
 
-        // Consume the original Rc to get the value. Should succeed unless another thread
-        // upgraded a weak reference to a strong one in parallel.
-        match Rc::try_unwrap(original_rc) {
-            Ok(value) => {
-                // Got the value, old weak pointers are now orphaned.
+        // Consume the original Rc to get the value. Since Rcs can't be shared between threads and
+        // we checked the strong count is 1, this will always succeed.
+        let value = Rc::try_unwrap(original_rc).unwrap_or_else(|_| {
+            unreachable!("Rc::try_unwrap failed: strong count was 1 and now isn't")
+        });
 
-                // Initialize the pre-allocated memory.
-                // get_mut is guaranteed safe because preallocated_rc count is 1.
-                let slot = get_mut_unchecked(&mut preallocated_rc);
-                slot.write(value); // Moves value, initializes memory.
+        // Got the value, old weak pointers are now orphaned.
 
-                // Convert Rc<MaybeUninit<T>> -> Rc<T>
-                let final_rc = preallocated_rc.assume_init();
-                // `preallocated_rc` is now consumed.
+        // Initialize the pre-allocated memory.
+        // get_mut is guaranteed safe because preallocated_rc count is 1.
+        let slot = get_mut_unchecked(&mut preallocated_rc);
+        slot.write(value); // Moves value, initializes memory.
 
-                // Write the new Rc<T> back into the user's reference location.
-                ptr::write(rc_ptr, final_rc); // Consumes final_rc.
+        // Convert Rc<MaybeUninit<T>> -> Rc<T>
+        let final_rc = preallocated_rc.assume_init();
+        // `preallocated_rc` is now consumed.
 
-                // Return mutable reference from the new Rc. Guaranteed safe.
-                // SAFETY: We just wrote a valid Rc<T> to `rc`.
-                Ok(get_mut_unchecked(rc))
-            }
-            Err(restored_rc) => {
-                // Failed to unwrap, meaning another thread upgraded a weak reference.
-                ptr::write(rc_ptr, restored_rc); // Consumes restored_rc.
-                Err(rc) // Indicate failure.
-            }
-        }
+        // Write the new Rc<T> back into the user's reference location.
+        ptr::write(rc_ptr, final_rc); // Consumes final_rc.
+
+        // Return mutable reference from the new Rc. Guaranteed safe.
+        // SAFETY: We just wrote a valid Rc<T> to `rc`.
+        Ok(get_mut_unchecked(rc))
     }
 }
 
