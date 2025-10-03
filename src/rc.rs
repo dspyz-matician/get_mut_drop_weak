@@ -50,11 +50,15 @@ pub fn get_mut_drop_weak<T>(rc: &mut Rc<T>) -> Result<&mut T, &mut Rc<T>> {
     let mut preallocated_rc: Rc<MaybeUninit<T>> = Rc::new_uninit();
     // --- Allocation succeeded ---
 
+    // Reborrow rc as a raw pointer.
     let rc_ptr = ptr::from_mut(rc);
 
-    // Unsafe block to perform the swap without panicking mid-state-change.
     unsafe {
         // Read the original Rc out, leaving `rc` pointing to invalid memory temporarily.
+        // SAFETY:
+        // The data under `rc` has not been touched yet.
+        // We will write a valid value back to `rc_ptr` before our `rc` "reborrow" ends.
+        // The intervening code never panics.
         let original_rc = ptr::read(rc_ptr);
 
         // Consume the original Rc to get the value. Since Rcs can't be shared between threads and
@@ -66,19 +70,21 @@ pub fn get_mut_drop_weak<T>(rc: &mut Rc<T>) -> Result<&mut T, &mut Rc<T>> {
         // Got the value, old weak pointers are now orphaned.
 
         // Initialize the pre-allocated memory.
-        // get_mut is guaranteed safe because preallocated_rc count is 1.
+        // SAFETY: preallocated_rc has not been cloned or downgraded since construction.
         let slot = get_mut_unchecked(&mut preallocated_rc);
         slot.write(value); // Moves value, initializes memory.
 
-        // Convert Rc<MaybeUninit<T>> -> Rc<T>
+        // SAFETY: We just initialized the memory above.
         let final_rc = preallocated_rc.assume_init();
         // `preallocated_rc` is now consumed.
 
         // Write the new Rc<T> back into the user's reference location.
+        // rc_ptr _already_ held a valid Rc<T> so it must be aligned.
+        // We know we have exclusive access because we were passed an unshared reference.
         ptr::write(rc_ptr, final_rc); // Consumes final_rc.
 
         // Return mutable reference from the new Rc. Guaranteed safe.
-        // SAFETY: We just wrote a valid Rc<T> to `rc`.
+        // SAFETY: The newly-constructed `Rc` still has not been cloned or downgraded.
         Ok(get_mut_unchecked(rc))
     }
 }

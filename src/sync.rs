@@ -50,11 +50,15 @@ pub fn get_mut_drop_weak<T>(arc: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
     let mut preallocated_arc: Arc<MaybeUninit<T>> = Arc::new_uninit();
     // --- Allocation succeeded ---
 
+    // Reborrow arc as a raw pointer.
     let arc_ptr = ptr::from_mut(arc);
 
-    // Unsafe block to perform the swap without panicking mid-state-change.
     unsafe {
         // Read the original Arc out, leaving `arc` pointing to invalid memory temporarily.
+        // SAFETY:
+        // The data under `arc` has not been touched yet.
+        // We will write a valid value back to `arc_ptr` before our `arc` "reborrow" ends.
+        // The intervening code never panics.
         let original_arc = ptr::read(arc_ptr);
 
         // Consume the original Arc to get the value. Should succeed unless another thread
@@ -64,23 +68,29 @@ pub fn get_mut_drop_weak<T>(arc: &mut Arc<T>) -> Result<&mut T, &mut Arc<T>> {
                 // Got the value, old weak pointers are now orphaned.
 
                 // Initialize the pre-allocated memory.
-                // get_mut is guaranteed safe because preallocated_arc count is 1.
+                // SAFETY: preallocated_arc has not been cloned or downgraded since construction.
                 let slot = get_mut_unchecked(&mut preallocated_arc);
                 slot.write(value); // Moves value, initializes memory.
 
-                // Convert Arc<MaybeUninit<T>> -> Arc<T>
+                // SAFETY: We just initialized the memory above.
                 let final_arc = preallocated_arc.assume_init();
                 // `preallocated_arc` is now consumed.
 
                 // Write the new Arc<T> back into the user's reference location.
+                // SAFETY:
+                // arc_ptr _already_ held a valid Arc<T> so it must be aligned.
+                // We know we have exclusive access because we were passed an unshared reference.
                 ptr::write(arc_ptr, final_arc); // Consumes final_arc.
 
                 // Return mutable reference from the new Arc. Guaranteed safe.
-                // SAFETY: We just wrote a valid Arc<T> to `arc`.
+                // SAFETY: The newly-constructed `Arc` still has not been cloned or downgraded.
                 Ok(get_mut_unchecked(arc))
             }
             Err(restored_arc) => {
                 // Failed to unwrap, meaning another thread upgraded a weak reference.
+                // SAFETY:
+                // arc_ptr _already_ held a valid Arc<T> so it must be aligned.
+                // We know we have exclusive access because we were passed an unshared reference.
                 ptr::write(arc_ptr, restored_arc); // Consumes restored_arc.
                 Err(arc) // Indicate failure.
             }
