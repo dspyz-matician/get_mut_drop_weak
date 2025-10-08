@@ -1,7 +1,7 @@
 use std::ptr;
 use std::sync::Arc;
 
-use get_mut_drop_weak::get_mut_drop_weak;
+use get_mut_drop_weak::sync::get_mut_drop_weak;
 
 #[test]
 fn test_exclusive_access_no_weak() {
